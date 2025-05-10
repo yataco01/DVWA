@@ -1,0 +1,133 @@
+name: Seguridad CI
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  seguridad:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clonar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Ejecutar Trivy (dependencias)
+        run: trivy fs --exit-code 1 --severity HIGH,CRITICAL .
+
+      - name: Install TruffleHog
+        run: |
+          python -m pip install --upgrade pip
+          pip install truffleHog
+
+      - name: Run TruffleHog
+        run: trufflehog --json --max_depth 50 --since_commit HEAD .
+
+      - name: Generar métricas de vulnerabilidades (OWASP SAMM)
+        run: |
+          # Verificar que los archivos existen
+          ls -la trivy_report.json trivy_image_report.json zap_report.json trufflehog_report.json || echo "Advertencia: Algunos archivos de reporte no existen"
+          
+          # Contar vulnerabilidades críticas de Trivy (dependencias)
+          TRIVY_COUNT=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH")] | length' trivy_report.json || echo 0)
+          echo "Vulnerabilidades críticas en dependencias: $TRIVY_COUNT"
+          
+          # Contar vulnerabilidades críticas de Trivy (imagen)
+          TRIVY_IMAGE_COUNT=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH")] | length' trivy_image_report.json || echo 0)
+          echo "Vulnerabilidades críticas en imagen: $TRIVY_IMAGE_COUNT"
+          
+          # Contar vulnerabilidades de ZAP
+          ZAP_COUNT=$(jq '[.site[].alerts[]? | select(.risk == "High" or .risk == "Medium")] | length' zap_report.json || echo 0)
+          echo "Vulnerabilidades en la aplicación web: $ZAP_COUNT"
+          
+          # Contar secretos de TruffleHog
+          TRUFFLEHOG_COUNT=$(jq 'length' trufflehog_report.json || echo 0)
+          echo "Secretos detectados: $TRUFFLEHOG_COUNT"
+          
+          # Generar métricas en JSON
+          echo "{\"trivy_vulns\": $TRIVY_COUNT, \"trivy_image_vulns\": $TRIVY_IMAGE_COUNT, \"zap_vulns\": $ZAP_COUNT, \"trufflehog_secrets\": $TRUFFLEHOG_COUNT}" > metrics.json
+          
+          # Mostrar métricas
+          cat metrics.json
+
+      - name: Subir métricas como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-metrics
+          path: metrics.json
+        if: always()
+
+      - name: Crear issues en GitHub para vulnerabilidades críticas
+        if: always() && (steps.metrics.outputs.TRIVY_COUNT != '0' || steps.metrics.outputs.TRIVY_IMAGE_COUNT != '0' || steps.metrics.outputs.ZAP_COUNT != '0' || steps.metrics.outputs.TRUFFLEHOG_COUNT != '0' || failure())
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const trivyReport = JSON.parse(fs.readFileSync('trivy_report.json'));
+            const trivyImageReport = JSON.parse(fs.readFileSync('trivy_image_report.json'));
+            const zapReport = JSON.parse(fs.readFileSync('zap_report.json'));
+            const trufflehogReport = JSON.parse(fs.readFileSync('trufflehog_report.json'));
+
+            let issues = [];
+
+            // Vulnerabilidades críticas de Trivy (dependencias)
+            trivyReport.Results?.forEach(result => {
+              result.Vulnerabilities?.forEach(vuln => {
+                if (vuln.Severity === 'CRITICAL' || vuln.Severity === 'HIGH') {
+                  issues.push({
+                    title: `Vulnerabilidad crítica detectada: ${vuln.VulnerabilityID}`,
+                    body: `**CVE**: ${vuln.VulnerabilityID}\n**Severidad**: ${vuln.Severity}\n**Paquete**: ${vuln.PkgName}\n**Descripción**: ${vuln.Description}\nAcción requerida: Actualizar o mitigar.`
+                  });
+                }
+              });
+            });
+
+            // Vulnerabilidades críticas de Trivy (imagen)
+            trivyImageReport.Results?.forEach(result => {
+              result.Vulnerabilities?.forEach(vuln => {
+                if (vuln.Severity === 'CRITICAL' || vuln.Severity === 'HIGH') {
+                  issues.push({
+                    title: `Vulnerabilidad crítica en imagen: ${vuln.VulnerabilityID}`,
+                    body: `**CVE**: ${vuln.VulnerabilityID}\n**Severidad**: ${vuln.Severity}\n**Paquete**: ${vuln.PkgName}\n**Descripción**: ${vuln.Description}\nAcción requerida: Actualizar imagen.`
+                  });
+                }
+              });
+            });
+
+            // Vulnerabilidades de ZAP
+            zapReport.site?.forEach(site => {
+              site.alerts?.forEach(alert => {
+                if (alert.risk === 'High') {
+                  issues.push({
+                    title: `Vulnerabilidad web detectada: ${alert.name}`,
+                    body: `**Riesgo**: ${alert.risk}\n**Descripción**: ${alert.desc}\n**Solución**: ${alert.solution}\nAcción requerida: Implementar corrección.`
+                  });
+                }
+              });
+            });
+
+            // Secretos de TruffleHog
+            if (trufflehogReport.length > 0) {
+              issues.push({
+                title: `Secretos detectados en el repositorio`,
+                body: `Se encontraron secretos en el código. Revisar el reporte 'trufflehog_report.json' para detalles. Acción requerida: Rotar las claves comprometidas.`
+              });
+            }
+
+            // Crear issues
+            for (const issue of issues) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issue.title,
+                body: issue.body
+              });
+            }
+
+      - name: Resultado del pipeline
+        run: echo "El pipeline de seguridad ha terminado correctamente"
